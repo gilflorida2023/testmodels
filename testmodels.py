@@ -1,6 +1,7 @@
 import requests
 import time
 import json
+import re
 
 def get_ollama_models():
     """
@@ -18,20 +19,22 @@ def get_ollama_models():
         print(f"Error fetching models: {e}")
         return []
 
+def extract_model_number(model_name):
+    """
+    Extract the numeric part from model names for proper sorting.
+    Handles formats like 'gemma3:1b', 'gemma3:12b', 'deepseek-r1:1.5b', etc.
+    """
+    # Split on ':' and take the last part
+    version_part = model_name.split(':')[-1]
+    # Extract all numbers and decimals
+    numbers = re.findall(r'\d+\.?\d*', version_part)
+    if numbers:
+        return float(numbers[0])
+    return 0
+
 def query_llm_with_timeout(model, prompt, timeoutsecs, answer="Timeout"):
     """
     Query an LLM with a timeout and return execution duration and answer.
-    
-    Args:
-        model (str): The model to use for generation
-        prompt (str): The prompt to send to the model
-        timeoutsecs (int): Maximum allowed time in seconds
-        answer (str): Default answer to return if timeout occurs
-        
-    Returns:
-        tuple: (execution_duration, answer)
-               execution_duration is in seconds
-               answer is the complete response or the default answer if timeout occurred
     """
     url = "http://localhost:11434/api/generate"
     data = {
@@ -41,7 +44,7 @@ def query_llm_with_timeout(model, prompt, timeoutsecs, answer="Timeout"):
     }
     
     start_time = time.time()
-    result = answer  # Initialize with default answer
+    result = answer
     
     try:
         with requests.post(url, json=data, stream=True, timeout=timeoutsecs) as r:
@@ -54,25 +57,25 @@ def query_llm_with_timeout(model, prompt, timeoutsecs, answer="Timeout"):
                     raise TimeoutError("Timeout reached")
     except TimeoutError:
         pass
-        #print(f"Timeout reached after {timeoutsecs} seconds")
     except Exception as e:
         pass
-        #print(f"Error querying model {model}: {e}")
+    
+    if result and isinstance(result, str):
+        result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
     
     execution_duration = time.time() - start_time
-    return (execution_duration, result.strip() if result else answer)
+    return (execution_duration, result if result else answer)
 
 def test_all_models():
     """
     Test all available models with a standard prompt and timeout
     """
-    #prompt = "how many r's in strawberry?"
-    prompt = "one word response, yes or no, is 3.2 >  3.11?"
-    timeout_sec = 200  # 5 minutes timeout
+    prompt = "No explanation. Brief one word response, yes or no.Question: is 3.2 >  3.11?"
+    timeout_sec = 100
     
-    #models = get_ollama_models()
-    # Get and sort models in one line
-    models = sorted(get_ollama_models())
+    models = get_ollama_models()
+    # Custom sorting: first by model family, then by extracted version number
+    models.sort(key=lambda x: (x.split(':')[0], extract_model_number(x)))
     
     if not models:
         print("No models available to test")
@@ -82,12 +85,11 @@ def test_all_models():
     print("=" * 60)
     
     for model in models:
-        print(f"Testing model: {model}")
         duration, answer = query_llm_with_timeout(model, prompt, timeout_sec)
-        
-        print(f"Execution duration: {duration:.2f} seconds")
-        print(f"Answer: {answer}")
-        print("=" * 60)
+        #print(f"Testing model: {model}")
+        #print(f"Execution duration: {duration:.2f} seconds")
+        #print(f"Answer: {answer}")
+        print(f"{model},{duration:.2f} seconds,{answer}")
 
 if __name__ == "__main__":
     test_all_models()
