@@ -2,6 +2,7 @@ import requests
 import time
 import json
 import re
+import string 
 import subprocess
 from typing import Tuple, List
 
@@ -109,7 +110,9 @@ def test_all_models() -> None:
     for model in models:
         duration, answer = query_llm_with_timeout(model, prompt, timeout_sec)
         stop_model(model)  # Ensure model is stopped
-        print(f"{model:<30} {duration:>7.2f}s {answer:<10}")
+        # Convert to lowercase and strip punctuation from the start/end
+        answer_clean = answer.lower().strip(string.punctuation)
+        print(f"{model:<30} {duration:>7.2f}s {answer_clean:<10}")
     
     print("\nTest complete. All models stopped.")
 
