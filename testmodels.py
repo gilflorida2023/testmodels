@@ -21,30 +21,66 @@ def extract_model_number(model_name: str) -> float:
     numbers = re.findall(r'\d+\.?\d*', version_part)
     return float(numbers[0]) if numbers else 0
 
+#def stop_model(model_name: str) -> None:
+#    """
+#    Stop model using the Ollama CLI command.
+#    This is the most reliable method since we know the CLI command works.
+#    """
+#    try:
+#        # Extract base model name (without tag if present)
+#        #base_model = model_name.split(':')[0]
+#        
+#        # Use subprocess to call the Ollama CLI directly
+#        result = subprocess.run(
+#            #["ollama", "stop", base_model],
+#            ["ollama", "stop", model_name],
+#            capture_output=True,
+#            text=True,
+#            timeout=10
+#        )
+#        
+#        if result.returncode != 0:
+#            print(f"Warning: Could not stop {model_name}. Error: {result.stderr.strip()}")
+#    except subprocess.TimeoutExpired:
+#        print(f"Timeout while trying to stop {model_name}")
+#    except Exception as e:
+#        print(f"Error stopping {model_name}: {str(e)}")
 def stop_model(model_name: str) -> None:
     """
-    Stop model using the Ollama CLI command.
-    This is the most reliable method since we know the CLI command works.
+    Try to stop model using API first, fall back to CLI if needed.
     """
+    # First attempt: Try API method
     try:
-        # Extract base model name (without tag if present)
-        #base_model = model_name.split(':')[0]
-        
-        # Use subprocess to call the Ollama CLI directly
+        response = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model_name,
+                "prompt": "",
+                "stream": False,
+                "options": {"stop": True}
+            },
+            timeout=5
+        )
+        if response.status_code == 200:
+            return  # API method worked
+    except requests.exceptions.RequestException:
+        pass  # We'll fall back to CLI
+    
+    # Fallback: Use CLI command
+    try:
         result = subprocess.run(
-            #["ollama", "stop", base_model],
             ["ollama", "stop", model_name],
             capture_output=True,
             text=True,
             timeout=10
         )
-        
         if result.returncode != 0:
             print(f"Warning: Could not stop {model_name}. Error: {result.stderr.strip()}")
     except subprocess.TimeoutExpired:
         print(f"Timeout while trying to stop {model_name}")
     except Exception as e:
         print(f"Error stopping {model_name}: {str(e)}")
+
 
 def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_answer: str = "Timeout") -> Tuple[float, str]:
     """Query LLM with strict timeout and guaranteed cleanup."""
@@ -78,7 +114,7 @@ def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_an
 def test_all_models() -> None:
     """Test all models with proper cleanup."""
     prompt = "No explanation. Brief one word response, yes or no. Question: is 3.2 > 3.11?"
-    timeout_sec = 30  # More reasonable timeout
+    timeout_sec = 300  # More reasonable timeout
     
     models = get_ollama_models()
     if not models:
