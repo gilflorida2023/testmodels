@@ -21,30 +21,6 @@ def extract_model_number(model_name: str) -> float:
     numbers = re.findall(r'\d+\.?\d*', version_part)
     return float(numbers[0]) if numbers else 0
 
-#def stop_model(model_name: str) -> None:
-#    """
-#    Stop model using the Ollama CLI command.
-#    This is the most reliable method since we know the CLI command works.
-#    """
-#    try:
-#        # Extract base model name (without tag if present)
-#        #base_model = model_name.split(':')[0]
-#        
-#        # Use subprocess to call the Ollama CLI directly
-#        result = subprocess.run(
-#            #["ollama", "stop", base_model],
-#            ["ollama", "stop", model_name],
-#            capture_output=True,
-#            text=True,
-#            timeout=10
-#        )
-#        
-#        if result.returncode != 0:
-#            print(f"Warning: Could not stop {model_name}. Error: {result.stderr.strip()}")
-#    except subprocess.TimeoutExpired:
-#        print(f"Timeout while trying to stop {model_name}")
-#    except Exception as e:
-#        print(f"Error stopping {model_name}: {str(e)}")
 def stop_model(model_name: str) -> None:
     """
     Try to stop model using API first, fall back to CLI if needed.
@@ -113,8 +89,8 @@ def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_an
 
 def test_all_models() -> None:
     """Test all models with proper cleanup."""
-    prompt = "No explanation. Brief one word response, yes or no. Question: is 3.2 > 3.11?"
-    timeout_sec = 300  # More reasonable timeout
+    prompt = "Strictly answer only yes or no with no additional words, punctuation, or explanation.  Question: Is 3.2 > 3.11?"
+    timeout_sec = 60  # More reasonable timeout
     
     models = get_ollama_models()
     if not models:
@@ -124,7 +100,8 @@ def test_all_models() -> None:
     # Sort models by family and version
     models.sort(key=lambda x: (x.split(':')[0], extract_model_number(x)))
     
-    print(f"\nTesting {len(models)} models (timeout: {timeout_sec}s)")
+    print(f"prompt:{prompt}")
+    print(f"Testing {len(models)} models (timeout: {timeout_sec}s)")
     print("=" * 60)
     print(f"{'Model':<30} {'Time':>7} {'Response':<10}")
     print("-" * 60)
