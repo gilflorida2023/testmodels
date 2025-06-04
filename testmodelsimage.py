@@ -38,7 +38,7 @@ def get_ollama_models() -> List[str]:
 
 def get_model_modality(model_name: str) -> bool:
     """Check if model supports images with proper timeout."""
-    if model_name == "llava:7b":
+    if model_name.startswith("llava:"):
         return False
     if model_name in _MODALITY_CACHE:
         return _MODALITY_CACHE[model_name]
