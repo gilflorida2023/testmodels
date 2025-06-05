@@ -4,6 +4,7 @@ import json
 import re
 import string 
 import subprocess
+import sys
 from typing import Tuple, List
 
 def get_ollama_models() -> List[str]:
@@ -72,13 +73,12 @@ def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_an
         response.raise_for_status()
         result = response.json().get("response", default_answer)
     except requests.exceptions.Timeout:
-        pass #print(f"Timeout reached for {model}")
+        pass
     except requests.exceptions.RequestException as e:
-        pass #print(f"Request error for {model}: {e}")
+        pass
     except json.JSONDecodeError:
-        pass #print(f"Invalid response from {model}")
+        pass
     finally:
-        #stop_model(model)  # Ensure model is stopped
         pass
     
     # Clean response
@@ -88,10 +88,9 @@ def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_an
     duration = time.time() - start_time
     return (duration, result if result else default_answer)
 
-def test_all_models() -> None:
+def test_all_models(prompt: str) -> None:
     """Test all models with proper cleanup."""
-    prompt = "Strictly answer only yes or no with no additional words, punctuation, or explanation.  Question: Is 3.2 > 3.11?"
-    timeout_sec = 60  # More reasonable timeout
+    timeout_sec = 300  # Fixed timeout as in original
     
     models = get_ollama_models()
     if not models:
@@ -113,8 +112,15 @@ def test_all_models() -> None:
         # Convert to lowercase and strip punctuation from the start/end
         answer_clean = answer.lower().strip(string.punctuation)
         print(f"{model:<30} {duration:>7.2f}s {answer_clean:<10}")
+        print("-" * 60)
     
     print("\nTest complete. All models stopped.")
 
 if __name__ == "__main__":
-    test_all_models()
+    if len(sys.argv) < 2:
+        print("Error: Please provide a prompt as a command-line argument")
+        print("Example: python testmodels.py \"Is 3.2 > 3.11?\"")
+        sys.exit(1)
+    
+    prompt = " ".join(sys.argv[1:])
+    test_all_models(prompt)

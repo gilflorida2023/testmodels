@@ -18,7 +18,7 @@ STRICT INSTRUCTIONS:
 
 NOW TRANSCRIBE THIS IMAGE:
 """
-TIMEOUT = 1100
+TIMEOUT = 2100 # 35 minutes
 
 _MODALITY_CACHE: Dict[str, bool] = {}
 
@@ -128,6 +128,7 @@ def force_transcription(model: str, image_b64: str) -> Tuple[float, str]:
     except Exception as e:
         duration = time.time() - start
         #return (duration, f"🚨 {type(e).__name__}: {str(e)}")
+        stop_model(model)
         return (duration, "Timeout\n")
 
 def run_test(image_path: str) -> None:
@@ -155,7 +156,7 @@ def run_test(image_path: str) -> None:
     for model in models:
         #print(f"Starting transcription with {model}...")
         duration, text = force_transcription(model, image_b64)
-        stop_model(model)
+        #stop_model(model)
         
         elapsed = f"{duration:.2f}s"
         #preview = text.replace("\n", " ").strip()
