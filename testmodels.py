@@ -75,7 +75,14 @@ def stop_model(model_name: str) -> None:
 def query_llm_with_timeout(model: str, prompt: str, timeout_sec: int, default_answer: str = "Timeout") -> Tuple[float, str]:
     """Query LLM with strict timeout and guaranteed cleanup."""
     url = "http://localhost:11434/api/generate"
-    data = {"model": model, "prompt": prompt, "stream": False}
+    #data = {"model": model, "prompt": prompt, "stream": False}
+    data = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "temperature": 0,      # Disables randomness (always selects highest-probability token)
+        "seed": 42             # Fixes random seed for reproducible results
+    }
     
     start_time = time.time()
     result = default_answer
