@@ -254,7 +254,8 @@ def run_test_cycle(
             print(f"{model:<30} {duration:>7.2f}s | ", end='')
             if expected_answer:
                 print(f"Acc: {results[model].accuracy*100:.1f}%", end='')
-            print(f" | {response[:60].replace('\n', ' ')}...")
+            st = response[:60].replace('\n',' ')
+            print(f" | {st}...")
             
         # Brief pause between iterations
         if iteration < repeats:
