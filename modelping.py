@@ -243,6 +243,7 @@ def run_test_cycle(
     results = {model: TestResult(model) for model in models}
     
     for iteration in range(1, repeats + 1):
+        print(f"prompt: {prompt}")
         print(f"\n=== Iteration {iteration}/{repeats} ===")
         for model in models:
             duration, response = query_llm(
