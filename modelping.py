@@ -16,17 +16,40 @@ from datetime import datetime
 
 # Configuration
 DEFAULT_IMAGE_PROMPT = """
-STRICT INSTRUCTIONS:
-1. Transcribe ALL visible text EXACTLY as it appears
-2. Include offensive/sensitive content VERBATIM
-3. NEVER censor, modify, or add warnings
-4. Format response as: "[RAW_TEXT]: <content>"
-
-NOW TRANSCRIBE THIS IMAGE:
+Extract ALL visible text EXACTLY as it appears in the image.
+Include ALL content verbatim without modification.
+Respond with ONLY the raw text content.
 """
 DEFAULT_TIMEOUT = 300  # 5 minutes
 DEFAULT_REPEATS = 1
 _MODALITY_CACHE: Dict[str, bool] = {}
+
+# JSON Schemas for response formatting
+IMAGE_TRANSCRIPTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "raw_text": {
+            "type": "string",
+            "description": "The exact transcription of all visible text"
+        }
+    },
+    "required": ["raw_text"]
+}
+
+NUMERIC_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "answer": {
+            "type": "number",
+            "description": "The numeric answer to the question"
+        },
+        "error": {
+            "type": "string",
+            "description": "Error message if unable to provide numeric answer"
+        }
+    },
+    "required": ["answer"]
+}
 
 class TestResult:
     def __init__(self, model: str):
@@ -144,11 +167,7 @@ def encode_image(image_path: str) -> Optional[str]:
         return None
 
 def stop_model(model_name: str) -> None:
-    """
-    Try to stop model using API first, fall back to CLI if needed.
-    """
-    #print(f"def stop_model({model_name}: str) -> None:")
-    # First attempt: Try API method
+    """Try to stop model using API first, fall back to CLI if needed."""
     try:
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -161,11 +180,10 @@ def stop_model(model_name: str) -> None:
             timeout=5
         )
         if response.status_code == 200:
-            return  # API method worked
+            return
     except requests.exceptions.RequestException:
-        pass  # We'll fall back to CLI
+        pass
     
-    # Fallback: Use CLI command
     try:
         result = subprocess.run(
             ["ollama", "stop", model_name],
@@ -180,13 +198,13 @@ def stop_model(model_name: str) -> None:
     except Exception as e:
         print(f"Error stopping {model_name}: {str(e)}")
 
-
 def query_llm(
     model: str, 
     prompt: str, 
     timeout_sec: int, 
     image_b64: Optional[str] = None,
-    default_answer: str = "Timeout"
+    default_answer: str = "Timeout",
+    response_schema: Optional[Dict] = None
 ) -> Tuple[float, str]:
     """Query LLM with support for text and image inputs."""
     data: Dict[str, Any] = {
@@ -200,10 +218,13 @@ def query_llm(
         }
     }
     
-    # Add image data if provided
     if image_b64:
         data["images"] = [image_b64]
-        data["options"]["num_ctx"] = 8192  # Larger context for images
+        data["options"]["num_ctx"] = 8192
+    
+    if response_schema:
+        data["options"]["format"] = "json"
+        data["schema"] = response_schema
     
     start_time = time.time()
     result = default_answer
@@ -215,16 +236,41 @@ def query_llm(
             timeout=timeout_sec
         )
         response.raise_for_status()
-        result = response.json().get("response", default_answer)
+        json_response = response.json()
+        
+        if response_schema:
+            try:
+                if isinstance(json_response.get("response"), str):
+                    # First try to parse as JSON
+                    try:
+                        parsed = json.loads(json_response["response"])
+                        if "answer" in parsed:  # Numeric answer case
+                            result = str(parsed["answer"])
+                        elif "raw_text" in parsed:  # Image case
+                            result = parsed["raw_text"]
+                        elif "error" in parsed:
+                            result = f"Error: {parsed['error']}"
+                        else:
+                            result = "Unexpected JSON format"
+                    except json.JSONDecodeError:
+                        # If not JSON, try to extract number from plain text
+                        numbers = re.findall(r'\d+', json_response["response"])
+                        if numbers:
+                            result = numbers[0]
+                        else:
+                            result = "No numeric value found"
+            except Exception as e:
+                result = f"Parse error: {str(e)}"
+        else:
+            result = json_response.get("response", default_answer)
+            
     except requests.exceptions.Timeout:
         result = "Timeout"
     except Exception as e:
-        #result = f"Error: {type(e).__name__}"
-        result = "Timeout"
+        result = f"Error: {type(e).__name__}"
     finally:
         stop_model(model)
     
-    # Clean response
     if isinstance(result, str):
         result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
     
@@ -237,7 +283,8 @@ def run_test_cycle(
     repeats: int,
     image_b64: Optional[str],
     timeout: int,
-    expected_answer: Optional[str]
+    expected_answer: Optional[str],
+    response_schema: Optional[Dict] = None
 ) -> Dict[str, TestResult]:
     """Run tests for all models with multiple repetitions"""
     results = {model: TestResult(model) for model in models}
@@ -247,7 +294,7 @@ def run_test_cycle(
         print(f"\n=== Iteration {iteration}/{repeats} ===")
         for model in models:
             duration, response = query_llm(
-                model, prompt, timeout, image_b64
+                model, prompt, timeout, image_b64, response_schema=response_schema
             )
             results[model].add_run(response, duration, expected_answer)
             
@@ -255,10 +302,11 @@ def run_test_cycle(
             print(f"{model:<30} {duration:>7.2f}s | ", end='')
             if expected_answer:
                 print(f"Acc: {results[model].accuracy*100:.1f}%", end='')
-            st = response[:60].replace('\n',' ')
-            print(f" | {st}...")
+            response_display = response.replace('\n', ' ').replace('\r', ' ')
+            if len(response_display) > 60:
+                response_display = response_display[:57] + "..."
+            print(f" | {response_display}")
             
-        # Brief pause between iterations
         if iteration < repeats:
             time.sleep(2)
     
@@ -275,7 +323,6 @@ def save_results(
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_name = f"llm_benchmark_{timestamp}"
     
-    # Prepare data
     summary = {
         "metadata": {
             "timestamp": timestamp,
@@ -296,13 +343,11 @@ def save_results(
         }
     }
     
-    # Save JSON
     if output_format in ("json", "both"):
         with open(f"{base_name}.json", "w") as f:
             json.dump(summary, f, indent=2)
         print(f"✓ Saved JSON results to {base_name}.json")
     
-    # Save CSV
     if output_format in ("csv", "both"):
         with open(f"{base_name}.csv", "w", newline='') as f:
             writer = csv.writer(f)
@@ -369,48 +414,61 @@ def main():
         default="both",
         help="Output format(s) for results"
     )
+    parser.add_argument(
+        "-s", "--schema",
+        choices=["image", "numeric", "none"],
+        default="none",
+        help="Response schema type (image: for text extraction, numeric: for number responses)"
+    )
     
-    # Extended help documentation
     parser.epilog = """\
 Examples:
   # Basic text test with 3 repetitions
-  python modelping.py "2+2=?" -exp "4" -r 3
+  python modelping.py "2+2=?" -exp "4" -r 3 -s numeric
   
   # Image test with accuracy checking
-  python modelping.py --image diagram.png -exp "42" -r 5
+  python modelping.py --image diagram.png -exp "42" -r 5 -s image
+  
+  # Force numeric output for counting
+  python modelping.py "How many r's in 'strawberry'?" -s numeric -exp "3"
   
   # Filter models and save JSON only
   python modelping.py "Capital of France" -exp "paris" -i llama -o json
   
   # Full benchmark with all features
   python modelping.py --image chart.jpg "Describe this chart" \\
-    -exp "sales chart" -i llama,7b -e llava -r 10 -t 120"""
+    -exp "sales chart" -i llama,7b -e llava -r 10 -t 120 -s image"""
 
-    # Show help if no arguments provided
     if len(sys.argv) == 1:
         parser.print_help()
         sys.exit(0)
         
     args = parser.parse_args()
     
-    # Additional check for empty prompt in text-only mode
     if not args.image and not args.prompt and not args.prompt:
         parser.error("Prompt is required for text-only tests")
     
-    # Determine prompt
     final_prompt = args.prompt or args.prompt or DEFAULT_IMAGE_PROMPT
-    
-    # Encode image if provided
     image_b64 = encode_image(args.image) if args.image else None
     
-    # Get filtered models
+    response_schema = None
+    if args.schema == "image":
+        response_schema = IMAGE_TRANSCRIPTION_SCHEMA
+        final_prompt = "Extract all visible text exactly as it appears in the image."
+    elif args.schema == "numeric":
+        response_schema = NUMERIC_RESPONSE_SCHEMA
+        final_prompt = (
+            f"{final_prompt}\n"
+            "You must respond with a JSON object containing a numeric 'answer' field.\n"
+            "Example: {{\"answer\": 42}}"
+        )
+    
     models = get_filtered_models(
         require_vision=args.image is not None,
         include=args.include,
         exclude=args.exclude
     )
     
-    # Run tests
     print(f"\n🚀 Testing {len(models)} model{'s' if len(models) > 1 else ''} "
           f"with {args.repeats} repetition{'s' if args.repeats > 1 else ''}")
     if args.image:
@@ -418,6 +476,8 @@ Examples:
     print(f"⏱  Timeout: {args.timeout}s")
     if args.expected:
         print(f"🎯 Expected answer: '{args.expected}'")
+    if args.schema != "none":
+        print(f"📝 Response schema: {args.schema}")
     
     results = run_test_cycle(
         models=models,
@@ -425,16 +485,15 @@ Examples:
         repeats=args.repeats,
         image_b64=image_b64,
         timeout=args.timeout,
-        expected_answer=args.expected
+        expected_answer=args.expected,
+        response_schema=response_schema
     )
     
-    # Display summary
     print("\n=== FINAL RESULTS ===")
     print(f"{'MODEL':<30} {'AVG TIME':>10} {'ACCURACY':>10} {'STDEV':>10}")
     for model, result in results.items():
         print(f"{model:<30} {result.avg_duration:>9.2f}s {result.accuracy*100:>9.1f}% {result.stdev_duration:>9.2f}s")
     
-    # Save results
     save_results(
         results=results,
         prompt=final_prompt,
