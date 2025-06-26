@@ -23,15 +23,13 @@ Respond with ONLY the raw text content.
 DEFAULT_TIMEOUT = 300  # 5 minutes
 DEFAULT_REPEATS = 1
 _MODALITY_CACHE: Dict[str, bool] = {}
+_MODEL_DETAILS_CACHE: Dict[str, Dict] = {}
 
-# JSON Schemas for response formatting
+# JSON Schemas
 IMAGE_TRANSCRIPTION_SCHEMA = {
     "type": "object",
     "properties": {
-        "raw_text": {
-            "type": "string",
-            "description": "The exact transcription of all visible text"
-        }
+        "raw_text": {"type": "string"}
     },
     "required": ["raw_text"]
 }
@@ -39,14 +37,8 @@ IMAGE_TRANSCRIPTION_SCHEMA = {
 NUMERIC_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
-        "answer": {
-            "type": "number",
-            "description": "The numeric answer to the question"
-        },
-        "error": {
-            "type": "string",
-            "description": "Error message if unable to provide numeric answer"
-        }
+        "answer": {"type": "number"},
+        "error": {"type": "string"}
     },
     "required": ["answer"]
 }
@@ -80,32 +72,18 @@ class TestResult:
     def stdev_duration(self) -> float:
         return stdev(self.durations) if len(self.durations) > 1 else 0.0
 
-def get_ollama_models() -> List[str]:
-    """Get list of available Ollama models."""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=10)
-        response.raise_for_status()
-        return [model['name'] for model in response.json().get('models', [])]
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching models: {e}")
-        return []
-
-def filter_models(models: List[str], include: Optional[str], exclude: Optional[str]) -> List[str]:
-    """Filter models based on include/exclude patterns."""
-    if include:
-        include_patterns = [p.strip().lower() for p in include.split(",")]
-        models = [m for m in models if any(p in m.lower() for p in include_patterns)]
+def get_model_details(model_name: str) -> Dict[str, Any]:
+    """Fetch detailed model capabilities and parameters"""
+    if model_name in _MODEL_DETAILS_CACHE:
+        return _MODEL_DETAILS_CACHE[model_name]
     
-    if exclude:
-        exclude_patterns = [p.strip().lower() for p in exclude.split(",")]
-        models = [m for m in models if not any(p in m.lower() for p in exclude_patterns)]
-    
-    return models
-
-def get_model_modality(model_name: str) -> bool:
-    """Check if model supports images."""
-    if model_name in _MODALITY_CACHE:
-        return _MODALITY_CACHE[model_name]
+    details = {
+        "family": model_name.split(':')[0],
+        "parameters": "Unknown",
+        "context_window": 2048,
+        "json_mode": False,
+        "vision": False
+    }
     
     try:
         response = requests.post(
@@ -114,43 +92,90 @@ def get_model_modality(model_name: str) -> bool:
             timeout=10
         )
         response.raise_for_status()
-        is_multimodal = "vision" in response.json().get("capabilities", [])
-        _MODALITY_CACHE[model_name] = is_multimodal
-        return is_multimodal
+        data = response.json()
+        
+        # Extract capabilities
+        details.update({
+            "vision": "vision" in data.get("capabilities", []),
+            "json_mode": data.get("options", {}).get("json_mode", False),
+            "context_window": data.get("options", {}).get("num_ctx", 2048)
+        })
+        
+        # Estimate parameters from name if not in metadata
+        size_match = re.search(r':(\d+\.?\d*)[bB]', model_name)
+        if size_match:
+            details["parameters"] = f"{size_match.group(1)}B"
+        elif "size" in data.get("details", {}):
+            details["parameters"] = data["details"]["size"]
+            
     except Exception:
-        # Fallback heuristic
+        # Fallback to name-based detection
+        size_match = re.search(r':(\d+\.?\d*)[bB]', model_name)
+        if size_match:
+            details["parameters"] = f"{size_match.group(1)}B"
+        
         multimodal_keywords = ["vision", "llava", "bakllava", "fuyu", "cogvlm"]
-        is_multimodal = any(kw in model_name.lower() for kw in multimodal_keywords)
-        _MODALITY_CACHE[model_name] = is_multimodal
-        return is_multimodal
+        details["vision"] = any(kw in model_name.lower() for kw in multimodal_keywords)
+    
+    _MODEL_DETAILS_CACHE[model_name] = details
+    return details
 
-def get_filtered_models(require_vision: bool, include: Optional[str], exclude: Optional[str]) -> List[str]:
-    """Get models with optional filtering."""
-    models = get_ollama_models()
-    if not models:
-        print("❌ No models available")
-        sys.exit(1)
+def get_ollama_models() -> List[str]:
+    """Get list of available Ollama models"""
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=10)
+        response.raise_for_status()
+        return [model['name'] for model in response.json().get('models', [])]
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching models: {e}")
+        return []
+
+def filter_models(
+    models: List[str], 
+    include: Optional[str] = None, 
+    exclude: Optional[str] = None,
+    require_vision: bool = False,
+    require_json: bool = False,
+    min_context: int = 0,
+    min_params: str = "0B"
+) -> List[str]:
+    """Filter models with advanced capabilities"""
+    filtered = []
+    min_params_value = float(min_params[:-1]) if min_params.endswith("B") else 0
     
-    if require_vision:
-        models = [m for m in models if get_model_modality(m)]
+    for model in models:
+        details = get_model_details(model)
+        model_params = float(details["parameters"][:-1]) if details["parameters"] != "Unknown" else 0
+        
+        # Apply filters
+        if require_vision and not details["vision"]:
+            continue
+        if require_json and not details["json_mode"]:
+            continue
+        if details["context_window"] < min_context:
+            continue
+        if model_params < min_params_value:
+            continue
+            
+        filtered.append(model)
     
-    models = filter_models(models, include, exclude)
-    if not models:
-        print("❌ No matching models available")
-        sys.exit(1)
+    # Apply include/exclude patterns
+    if include:
+        include_patterns = [p.strip().lower() for p in include.split(",")]
+        filtered = [m for m in filtered if any(p in m.lower() for p in include_patterns)]
     
-    # Sort models by family and version number
-    def get_sort_key(model: str) -> tuple:
-        parts = model.split(':')
-        family = parts[0]
-        version = ''.join(filter(str.isdigit, parts[-1]))
-        return (family, float(version) if version else 0.0)
+    if exclude:
+        exclude_patterns = [p.strip().lower() for p in exclude.split(",")]
+        filtered = [m for m in filtered if not any(p in m.lower() for p in exclude_patterns)]
     
-    models.sort(key=get_sort_key)
-    return models
+    # Sort by family and parameter count
+    return sorted(filtered, key=lambda x: (
+        get_model_details(x)["family"], 
+        float(get_model_details(x)["parameters"][:-1]) if get_model_details(x)["parameters"] != "Unknown" else 0
+    ))
 
 def encode_image(image_path: str) -> Optional[str]:
-    """Convert image to base64 with validation."""
+    """Convert image to base64 with validation"""
     try:
         path = Path(image_path)
         if not path.exists():
@@ -167,7 +192,7 @@ def encode_image(image_path: str) -> Optional[str]:
         return None
 
 def stop_model(model_name: str) -> None:
-    """Try to stop model using API first, fall back to CLI if needed."""
+    """Try to stop model using API first, fall back to CLI if needed"""
     try:
         response = requests.post(
             "http://localhost:11434/api/generate",
@@ -206,7 +231,7 @@ def query_llm(
     default_answer: str = "Timeout",
     response_schema: Optional[Dict] = None
 ) -> Tuple[float, str]:
-    """Query LLM with support for text and image inputs."""
+    """Query LLM with support for text and image inputs"""
     data: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
@@ -241,24 +266,17 @@ def query_llm(
         if response_schema:
             try:
                 if isinstance(json_response.get("response"), str):
-                    # First try to parse as JSON
                     try:
                         parsed = json.loads(json_response["response"])
-                        if "answer" in parsed:  # Numeric answer case
+                        if "answer" in parsed:
                             result = str(parsed["answer"])
-                        elif "raw_text" in parsed:  # Image case
+                        elif "raw_text" in parsed:
                             result = parsed["raw_text"]
-                        elif "error" in parsed:
-                            result = f"Error: {parsed['error']}"
                         else:
-                            result = "Unexpected JSON format"
+                            result = "Invalid JSON format"
                     except json.JSONDecodeError:
-                        # If not JSON, try to extract number from plain text
                         numbers = re.findall(r'\d+', json_response["response"])
-                        if numbers:
-                            result = numbers[0]
-                        else:
-                            result = "No numeric value found"
+                        result = numbers[0] if numbers else "No numeric value found"
             except Exception as e:
                 result = f"Parse error: {str(e)}"
         else:
@@ -287,12 +305,20 @@ def run_test_cycle(
     response_schema: Optional[Dict] = None
 ) -> Dict[str, TestResult]:
     """Run tests for all models with multiple repetitions"""
-    results = {model: TestResult(model) for model in models}
+    results = {}
+    
+    for model in models:
+        details = get_model_details(model)
+        if response_schema and not details["json_mode"]:
+            print(f"⚠️  Skipping {model} (no JSON mode support)")
+            continue
+            
+        results[model] = TestResult(model)
     
     for iteration in range(1, repeats + 1):
         print(f"prompt: {prompt}")
         print(f"\n=== Iteration {iteration}/{repeats} ===")
-        for model in models:
+        for model in results.keys():
             duration, response = query_llm(
                 model, prompt, timeout, image_b64, response_schema=response_schema
             )
@@ -301,7 +327,7 @@ def run_test_cycle(
             # Display interim results
             print(f"{model:<30} {duration:>7.2f}s | ", end='')
             if expected_answer:
-                print(f"Acc: {results[model].accuracy*100:.1f}%", end='')
+                print(f"Acc: {results[model].accuracy*100:>5.1f}%", end='')
             response_display = response.replace('\n', ' ').replace('\r', ' ')
             if len(response_display) > 60:
                 response_display = response_display[:57] + "..."
@@ -319,7 +345,7 @@ def save_results(
     expected: Optional[str],
     output_format: str = "both"
 ):
-    """Save results in CSV and/or JSON format"""
+    """Save results with model parameters"""
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_name = f"llm_benchmark_{timestamp}"
     
@@ -333,6 +359,9 @@ def save_results(
         },
         "results": {
             model: {
+                "family": get_model_details(model)["family"],
+                "parameters": get_model_details(model)["parameters"],
+                "context_window": get_model_details(model)["context_window"],
                 "responses": result.responses,
                 "durations": result.durations,
                 "accuracy": result.accuracy,
@@ -352,12 +381,16 @@ def save_results(
         with open(f"{base_name}.csv", "w", newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
-                "Model", "Avg Duration", "StdDev", 
-                "Accuracy", "Responses"
+                "Model", "Family", "Parameters", "Context Window",
+                "Avg Duration", "StdDev", "Accuracy", "Responses"
             ])
             for model, result in results.items():
+                details = get_model_details(model)
                 writer.writerow([
                     model,
+                    details["family"],
+                    details["parameters"],
+                    details["context_window"],
                     result.avg_duration,
                     result.stdev_duration,
                     result.accuracy,
@@ -367,7 +400,7 @@ def save_results(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM Benchmarking Tool with Statistical Analysis",
+        description="LLM Benchmarking Tool with Advanced Capability Detection",
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument(
@@ -418,26 +451,35 @@ def main():
         "-s", "--schema",
         choices=["image", "numeric", "none"],
         default="none",
-        help="Response schema type (image: for text extraction, numeric: for number responses)"
+        help="Response schema type"
     )
-    
+    parser.add_argument(
+        "--require-json",
+        action="store_true",
+        help="Only test models with native JSON mode support"
+    )
+    parser.add_argument(
+        "--min-context",
+        type=int,
+        default=0,
+        help="Minimum context window size (in tokens) for models to test"
+    )
+    parser.add_argument(
+        "--min-params",
+        default="0B",
+        help="Minimum parameter count (e.g., '7B') for models to test"
+    )
+
     parser.epilog = """\
 Examples:
-  # Basic text test with 3 repetitions
-  python modelping.py "2+2=?" -exp "4" -r 3 -s numeric
-  
-  # Image test with accuracy checking
-  python modelping.py --image diagram.png -exp "42" -r 5 -s image
-  
-  # Force numeric output for counting
-  python modelping.py "How many r's in 'strawberry'?" -s numeric -exp "3"
-  
-  # Filter models and save JSON only
-  python modelping.py "Capital of France" -exp "paris" -i llama -o json
-  
-  # Full benchmark with all features
-  python modelping.py --image chart.jpg "Describe this chart" \\
-    -exp "sales chart" -i llama,7b -e llava -r 10 -t 120 -s image"""
+  # Benchmark 7B+ models with JSON support
+  python modelping.py "2+2=?" -s numeric -exp 4 --require-json --min-params 7B
+
+  # Test vision models with >4k context
+  python modelping.py --image diagram.png --require-vision --min-context 4096
+
+  # Compare all 13B models
+  python modelping.py "Capital of France" -exp paris --min-params 13B"""
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -463,21 +505,34 @@ Examples:
             "Example: {{\"answer\": 42}}"
         )
     
-    models = get_filtered_models(
-        require_vision=args.image is not None,
+    models = filter_models(
+        models=get_ollama_models(),
         include=args.include,
-        exclude=args.exclude
+        exclude=args.exclude,
+        require_vision=args.image is not None,
+        require_json=args.require_json,
+        min_context=args.min_context,
+        min_params=args.min_params
     )
     
-    print(f"\n🚀 Testing {len(models)} model{'s' if len(models) > 1 else ''} "
-          f"with {args.repeats} repetition{'s' if args.repeats > 1 else ''}")
-    if args.image:
-        print(f"📷 Image: {args.image}")
-    print(f"⏱  Timeout: {args.timeout}s")
+    if not models:
+        print("❌ No models matching all filters")
+        sys.exit(1)
+    
+    print(f"\n🚀 Testing {len(models)} model{'s' if len(models) > 1 else ''}")
+    print(f"⏱  Timeout: {args.timeout}s | Repetitions: {args.repeats}")
     if args.expected:
         print(f"🎯 Expected answer: '{args.expected}'")
     if args.schema != "none":
         print(f"📝 Response schema: {args.schema}")
+    if args.require_json or args.min_context > 0 or args.min_params != "0B":
+        print("🔍 Filters:")
+        if args.require_json:
+            print("  - JSON mode required")
+        if args.min_context > 0:
+            print(f"  - Min context: {args.min_context} tokens")
+        if args.min_params != "0B":
+            print(f"  - Min parameters: {args.min_params}")
     
     results = run_test_cycle(
         models=models,
@@ -490,9 +545,11 @@ Examples:
     )
     
     print("\n=== FINAL RESULTS ===")
-    print(f"{'MODEL':<30} {'AVG TIME':>10} {'ACCURACY':>10} {'STDEV':>10}")
+    print(f"{'MODEL':<30} {'FAMILY':<10} {'PARAMS':<6} {'ACCURACY':>8} {'AVG TIME':>10}")
     for model, result in results.items():
-        print(f"{model:<30} {result.avg_duration:>9.2f}s {result.accuracy*100:>9.1f}% {result.stdev_duration:>9.2f}s")
+        details = get_model_details(model)
+        print(f"{model:<30} {details['family']:<10} {details['parameters']:<6} "
+              f"{result.accuracy*100:>7.1f}% {result.avg_duration:>9.2f}s")
     
     save_results(
         results=results,
