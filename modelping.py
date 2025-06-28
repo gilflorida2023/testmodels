@@ -40,8 +40,16 @@ NUMERIC_RESPONSE_SCHEMA = {
     "type": "object",
     "properties": {
         "answer": {
-            "type": "number",
-            "description": "The numeric answer to the question"
+            "oneOf": [
+                {
+                    "type": "integer",
+                    "description": "The integer answer to the question"
+                },
+                {
+                    "type": "number",
+                    "description": "The numeric answer to the question"
+                }
+            ]
         },
         "error": {
             "type": "string",
@@ -52,8 +60,9 @@ NUMERIC_RESPONSE_SCHEMA = {
 }
 
 class TestResult:
-    def __init__(self, model: str):
+    def __init__(self, model: str, scale: Optional[int] = None):
         self.model = model
+        self.scale = scale  # Precision setting for numeric responses
         self.responses = []
         self.durations = []
         self.correct = 0
@@ -65,8 +74,21 @@ class TestResult:
             self.correct += int(self._normalize(response) == self._normalize(expected))
     
     def _normalize(self, text: str) -> str:
-        """Normalize text for comparison"""
-        return text.lower().strip().translate(str.maketrans('', '', string.punctuation))
+        """Normalize text for comparison with precision handling"""
+        text = text.lower().strip().translate(str.maketrans('', '', string.punctuation))
+        
+        # Numeric handling only when scale is specified
+        if self.scale is not None:
+            try:
+                num = float(text)
+                # Format to specified precision
+                if self.scale == 0:
+                    return str(int(round(num)))
+                return f"{num:.{self.scale}f}"
+            except ValueError:
+                pass
+        
+        return text
     
     @property
     def accuracy(self) -> float:
@@ -198,6 +220,43 @@ def stop_model(model_name: str) -> None:
     except Exception as e:
         print(f"Error stopping {model_name}: {str(e)}")
 
+def extract_json_from_response(response_text: str) -> Optional[Dict]:
+    """Robustly extract JSON from response text, handling various formats."""
+    # Clean the response text first
+    cleaned_text = re.sub(r'<think>.*?</think>', '', response_text, flags=re.DOTALL).strip()
+    
+    # Try different approaches to find JSON
+    attempts = [
+        # Try parsing the entire cleaned text as JSON
+        lambda: json.loads(cleaned_text),
+        
+        # Try finding the last JSON object in the text
+        lambda: json.loads(re.findall(r'\{[^{}]*\}', cleaned_text)[-1]),
+        
+        # Try finding any JSON object with an 'answer' field
+        lambda: next(
+            json.loads(match)
+            for match in re.findall(r'\{[^{}]*\}', cleaned_text)
+            if '"answer":' in match or "'answer':" in match
+        ),
+        
+        # Try finding the most complete JSON object
+        lambda: json.loads(max(
+            re.findall(r'\{[^{}]*\}', cleaned_text),
+            key=len
+        ))
+    ]
+    
+    for attempt in attempts:
+        try:
+            result = attempt()
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, IndexError, StopIteration):
+            continue
+    
+    return None
+
 def query_llm(
     model: str, 
     prompt: str, 
@@ -207,12 +266,21 @@ def query_llm(
     response_schema: Optional[Dict] = None
 ) -> Tuple[float, str]:
     """Query LLM with support for text and image inputs."""
+    debug_info = {
+        "timestamp": datetime.now().isoformat(),
+        "model": model,
+        "prompt": prompt[:200] + "..." if len(prompt) > 200 else prompt,
+        "image": bool(image_b64),
+        "schema": "numeric" if response_schema == NUMERIC_RESPONSE_SCHEMA else 
+                 "image" if response_schema == IMAGE_TRANSCRIPTION_SCHEMA else "none"
+    }
+    
     data: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": 0,
+            "temperature": 0.3 if response_schema == NUMERIC_RESPONSE_SCHEMA else 0,
             "seed": 42,
             "top_k": 1
         }
@@ -236,33 +304,35 @@ def query_llm(
             timeout=timeout_sec
         )
         response.raise_for_status()
-        json_response = response.json()
+        api_response = response.json()
+        debug_info["raw_response"] = api_response
         
-        if response_schema:
-            try:
-                if isinstance(json_response.get("response"), str):
-                    # First try to parse as JSON
-                    try:
-                        parsed = json.loads(json_response["response"])
-                        if "answer" in parsed:  # Numeric answer case
-                            result = str(parsed["answer"])
-                        elif "raw_text" in parsed:  # Image case
-                            result = parsed["raw_text"]
-                        elif "error" in parsed:
-                            result = f"Error: {parsed['error']}"
-                        else:
-                            result = "Unexpected JSON format"
-                    except json.JSONDecodeError:
-                        # If not JSON, try to extract number from plain text
-                        numbers = re.findall(r'\d+', json_response["response"])
-                        if numbers:
-                            result = numbers[0]
-                        else:
-                            result = "No numeric value found"
-            except Exception as e:
-                result = f"Parse error: {str(e)}"
+        response_text = api_response.get("response", "")
+        debug_info["response_text"] = response_text
+        
+        if not response_schema:
+            result = response_text
         else:
-            result = json_response.get("response", default_answer)
+            # Try to extract JSON from the response
+            parsed_json = extract_json_from_response(response_text)
+            debug_info["parsed_json"] = parsed_json
+            
+            if parsed_json:
+                # Flexible answer extraction
+                answer = parsed_json.get("answer") or parsed_json.get("Answer") or parsed_json.get("value")
+                if answer is not None:
+                    result = str(answer)
+                elif "error" in parsed_json:
+                    result = f"Error: {parsed_json['error']}"
+                else:
+                    result = "Unexpected JSON format"
+            else:
+                # Fallback to extracting numbers from text
+                numbers = re.findall(r'\d+\.?\d*', response_text)
+                if numbers:
+                    result = numbers[0]
+                else:
+                    result = "No numeric value found"
             
     except requests.exceptions.Timeout:
         result = "Timeout"
@@ -271,10 +341,15 @@ def query_llm(
     finally:
         stop_model(model)
     
-    if isinstance(result, str):
-        result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
-    
     duration = time.time() - start_time
+    debug_info["processed_response"] = result
+    debug_info["duration"] = duration
+    
+    # Save debug info
+    with open("llm_debug.log", "a") as f:
+        json.dump(debug_info, f)
+        f.write("\n")
+    
     return duration, result
 
 def run_test_cycle(
@@ -284,10 +359,12 @@ def run_test_cycle(
     image_b64: Optional[str],
     timeout: int,
     expected_answer: Optional[str],
-    response_schema: Optional[Dict] = None
+    response_schema: Optional[Dict] = None,
+    scale: Optional[int] = None
 ) -> Dict[str, TestResult]:
     """Run tests for all models with multiple repetitions"""
-    results = {model: TestResult(model) for model in models}
+    # Pass scale to TestResult for numeric normalization
+    results = {model: TestResult(model, scale) for model in models}
     
     for iteration in range(1, repeats + 1):
         print(f"prompt: {prompt}")
@@ -420,22 +497,32 @@ def main():
         default="none",
         help="Response schema type (image: for text extraction, numeric: for number responses)"
     )
+    # New precision control argument
+    parser.add_argument(
+        "-sc", "--scale",
+        type=int,
+        default=0,
+        help="Precision for numeric answers (0=integer, 1=tenths, 2=hundredths, etc)"
+    )
     
     parser.epilog = """\
 Examples:
-  # Basic text test with 3 repetitions
-  python modelping.py "2+2=?" -exp "4" -r 3 -s numeric
+  # Basic text test with 3 repetitions (integer)
+  python modelping.py "2+2=?" -exp "4" -r 3 -s numeric -sc 0
+  
+  # Physics calculation with 1 decimal place
+  python modelping.py "Value of gravitational acceleration (m/s²)?" -s numeric -sc 1 -exp 9.8
+  
+  # Currency calculation with 2 decimal places
+  python modelping.py "15.99 * 1.08" -s numeric -sc 2 -exp 17.27
   
   # Image test with accuracy checking
   python modelping.py --image diagram.png -exp "42" -r 5 -s image
   
-  # Force numeric output for counting
-  python modelping.py "How many r's in 'strawberry'?" -s numeric -exp "3"
-  
   # Filter models and save JSON only
   python modelping.py "Capital of France" -exp "paris" -i llama -o json
   
-  # Full benchmark with all features
+  # Full benchmark with precision control
   python modelping.py --image chart.jpg "Describe this chart" \\
     -exp "sales chart" -i llama,7b -e llava -r 10 -t 120 -s image"""
 
@@ -457,10 +544,19 @@ Examples:
         final_prompt = "Extract all visible text exactly as it appears in the image."
     elif args.schema == "numeric":
         response_schema = NUMERIC_RESPONSE_SCHEMA
+        # Generate precision guidance based on scale
+        precision_text = "whole number" if args.scale == 0 else f"number with {args.scale} decimal places"
+        # Create example number based on scale
+        if args.scale == 0:
+            example_num = "42"
+        else:
+            example_num = f"3.{'0'*(args.scale-1)}1"  # e.g., "3.01" for scale=2
+        
         final_prompt = (
             f"{final_prompt}\n"
-            "You must respond with a JSON object containing a numeric 'answer' field.\n"
-            "Example: {{\"answer\": 42}}"
+            "Respond with JSON containing exactly one numeric 'answer' field.\n"
+            f"Answer with a {precision_text}.\n"
+            f"Example format: {{\"answer\": {example_num}}}"
         )
     
     models = get_filtered_models(
@@ -478,6 +574,8 @@ Examples:
         print(f"🎯 Expected answer: '{args.expected}'")
     if args.schema != "none":
         print(f"📝 Response schema: {args.schema}")
+    if args.schema == "numeric":
+        print(f"🧮 Precision: {args.scale} decimal place{'s' if args.scale != 1 else ''}")
     
     results = run_test_cycle(
         models=models,
@@ -486,7 +584,8 @@ Examples:
         image_b64=image_b64,
         timeout=args.timeout,
         expected_answer=args.expected,
-        response_schema=response_schema
+        response_schema=response_schema,
+        scale=args.scale if args.schema == "numeric" else None
     )
     
     print("\n=== FINAL RESULTS ===")
